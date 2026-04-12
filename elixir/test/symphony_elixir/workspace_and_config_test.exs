@@ -1080,6 +1080,27 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
              "excludeTmpdirEnvVar" => false,
              "excludeSlashTmp" => false
            }
+
+    assert Schema.resolve_turn_sandbox_policy(
+             %Schema{
+               codex: %Codex{turn_sandbox_policy: nil, thread_sandbox: "danger-full-access"},
+               workspace: %Schema.Workspace{root: "/tmp/ignored"}
+             },
+             "/tmp/workspace"
+           ) == %{
+             "type" => "dangerFullAccess"
+           }
+
+    assert Schema.resolve_turn_sandbox_policy(
+             %Schema{
+               codex: %Codex{turn_sandbox_policy: nil, thread_sandbox: "read-only"},
+               workspace: %Schema.Workspace{root: "/tmp/ignored"}
+             },
+             "/tmp/workspace"
+           ) == %{
+             "type" => "readOnly",
+             "networkAccess" => false
+           }
   end
 
   test "schema keeps workspace roots raw while sandbox helpers expand only for local use" do
@@ -1199,13 +1220,29 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       assert blank_workspace_policy == default_policy
 
+      danger_settings = %{
+        settings
+        | codex: %{settings.codex | thread_sandbox: "danger-full-access"}
+      }
+
+      assert {:ok, %{"type" => "dangerFullAccess"}} =
+               Schema.resolve_runtime_turn_sandbox_policy(danger_settings, issue_workspace)
+
       read_only_settings = %{
+        settings
+        | codex: %{settings.codex | thread_sandbox: "read-only"}
+      }
+
+      assert {:ok, %{"type" => "readOnly", "networkAccess" => false}} =
+               Schema.resolve_runtime_turn_sandbox_policy(read_only_settings, issue_workspace)
+
+      explicit_read_only_settings = %{
         settings
         | codex: %{settings.codex | turn_sandbox_policy: %{"type" => "readOnly", "networkAccess" => true}}
       }
 
       assert {:ok, %{"type" => "readOnly", "networkAccess" => true}} =
-               Schema.resolve_runtime_turn_sandbox_policy(read_only_settings, 123)
+               Schema.resolve_runtime_turn_sandbox_policy(explicit_read_only_settings, 123)
 
       future_settings = %{
         settings

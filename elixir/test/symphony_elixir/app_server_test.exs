@@ -183,6 +183,134 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  test "app server derives default turn sandbox policy from thread sandbox when explicit policy is omitted" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-thread-sandbox-defaults-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-1001A")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex-thread-sandbox-defaults.trace")
+      previous_trace = System.get_env("SYMP_TEST_CODEx_TRACE")
+
+      on_exit(fn ->
+        if is_binary(previous_trace) do
+          System.put_env("SYMP_TEST_CODEx_TRACE", previous_trace)
+        else
+          System.delete_env("SYMP_TEST_CODEx_TRACE")
+        end
+      end)
+
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex-thread-sandbox-defaults.trace}"
+      count=0
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-1001a"}}}'
+            ;;
+          3)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-1001a"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      issue = %Issue{
+        id: "issue-thread-sandbox-defaults",
+        identifier: "MT-1001A",
+        title: "Validate thread sandbox default mapping",
+        description: "Ensure runtime startup derives turn sandbox defaults from thread sandbox settings",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-1001A",
+        labels: ["backend"]
+      }
+
+      policy_cases = [
+        {"workspace-write",
+         %{
+           "type" => "workspaceWrite",
+           "writableRoots" => [Path.expand(workspace)],
+           "readOnlyAccess" => %{"type" => "fullAccess"},
+           "networkAccess" => false,
+           "excludeTmpdirEnvVar" => false,
+           "excludeSlashTmp" => false
+         }},
+        {"danger-full-access", %{"type" => "dangerFullAccess"}},
+        {"read-only", %{"type" => "readOnly", "networkAccess" => false}}
+      ]
+
+      Enum.each(policy_cases, fn {thread_sandbox, expected_turn_policy} ->
+        File.rm(trace_file)
+
+        write_workflow_file!(Workflow.workflow_file_path(),
+          workspace_root: workspace_root,
+          codex_command: "#{codex_binary} app-server",
+          codex_thread_sandbox: thread_sandbox
+        )
+
+        assert {:ok, _result} = AppServer.run(workspace, "Validate thread sandbox default mapping", issue)
+
+        trace = File.read!(trace_file)
+        lines = String.split(trace, "\n", trim: true)
+
+        assert Enum.any?(lines, fn line ->
+                 if String.starts_with?(line, "JSON:") do
+                   line
+                   |> String.trim_leading("JSON:")
+                   |> Jason.decode!()
+                   |> then(fn payload ->
+                     payload["method"] == "thread/start" &&
+                       get_in(payload, ["params", "sandbox"]) == thread_sandbox
+                   end)
+                 else
+                   false
+                 end
+               end)
+
+        assert Enum.any?(lines, fn line ->
+                 if String.starts_with?(line, "JSON:") do
+                   line
+                   |> String.trim_leading("JSON:")
+                   |> Jason.decode!()
+                   |> then(fn payload ->
+                     payload["method"] == "turn/start" &&
+                       get_in(payload, ["params", "sandboxPolicy"]) == expected_turn_policy
+                   end)
+                 else
+                   false
+                 end
+               end)
+      end)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "app server marks request-for-input events as a hard failure" do
     test_root =
       Path.join(
