@@ -543,15 +543,15 @@ defmodule SymphonyElixir.CoreTest do
       |> Map.put(:retry_attempts, %{})
     end)
 
+    scheduled_after_ms = System.monotonic_time(:millisecond)
     send(pid, {:DOWN, ref, :process, self(), :normal})
-    Process.sleep(50)
-    state = :sys.get_state(pid)
+    {state, observed_at_ms} = await_retry_attempt_state(pid, issue_id)
 
     refute Map.has_key?(state.running, issue_id)
     assert MapSet.member?(state.completed, issue_id)
     assert %{attempt: 1, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
     assert is_integer(due_at_ms)
-    assert_due_in_range(due_at_ms, 500, 1_100)
+    assert_due_at_between(due_at_ms, scheduled_after_ms + 1_000, observed_at_ms + 1_000)
   end
 
   test "abnormal worker exit increments retry attempt progressively" do
@@ -584,14 +584,14 @@ defmodule SymphonyElixir.CoreTest do
       |> Map.put(:retry_attempts, %{})
     end)
 
+    scheduled_after_ms = System.monotonic_time(:millisecond)
     send(pid, {:DOWN, ref, :process, self(), :boom})
-    Process.sleep(50)
-    state = :sys.get_state(pid)
+    {state, observed_at_ms} = await_retry_attempt_state(pid, issue_id)
 
     assert %{attempt: 3, due_at_ms: due_at_ms, identifier: "MT-559", error: "agent exited: :boom"} =
              state.retry_attempts[issue_id]
 
-    assert_due_in_range(due_at_ms, 39_500, 40_500)
+    assert_due_at_between(due_at_ms, scheduled_after_ms + 40_000, observed_at_ms + 40_000)
   end
 
   test "first abnormal worker exit waits before retrying" do
@@ -623,14 +623,14 @@ defmodule SymphonyElixir.CoreTest do
       |> Map.put(:retry_attempts, %{})
     end)
 
+    scheduled_after_ms = System.monotonic_time(:millisecond)
     send(pid, {:DOWN, ref, :process, self(), :boom})
-    Process.sleep(50)
-    state = :sys.get_state(pid)
+    {state, observed_at_ms} = await_retry_attempt_state(pid, issue_id)
 
     assert %{attempt: 1, due_at_ms: due_at_ms, identifier: "MT-560", error: "agent exited: :boom"} =
              state.retry_attempts[issue_id]
 
-    assert_due_in_range(due_at_ms, 9_000, 10_500)
+    assert_due_at_between(due_at_ms, scheduled_after_ms + 10_000, observed_at_ms + 10_000)
   end
 
   test "stale retry timer messages do not consume newer retry entries" do
@@ -750,11 +750,33 @@ defmodule SymphonyElixir.CoreTest do
     assert Orchestrator.select_worker_host_for_test(state, "worker-a") == "worker-a"
   end
 
-  defp assert_due_in_range(due_at_ms, min_remaining_ms, max_remaining_ms) do
-    remaining_ms = due_at_ms - System.monotonic_time(:millisecond)
+  defp await_retry_attempt_state(pid, issue_id, timeout_ms \\ 500)
+       when is_pid(pid) and is_binary(issue_id) and is_integer(timeout_ms) and timeout_ms > 0 do
+    deadline_ms = System.monotonic_time(:millisecond) + timeout_ms
+    do_await_retry_attempt_state(pid, issue_id, deadline_ms)
+  end
 
-    assert remaining_ms >= min_remaining_ms
-    assert remaining_ms <= max_remaining_ms
+  defp do_await_retry_attempt_state(pid, issue_id, deadline_ms) do
+    state = :sys.get_state(pid)
+
+    case Map.fetch(state.retry_attempts, issue_id) do
+      {:ok, _retry_attempt} ->
+        {state, System.monotonic_time(:millisecond)}
+
+      :error ->
+        if System.monotonic_time(:millisecond) >= deadline_ms do
+          flunk("Timed out waiting for retry attempt state for #{issue_id}")
+        else
+          Process.sleep(10)
+          do_await_retry_attempt_state(pid, issue_id, deadline_ms)
+        end
+    end
+  end
+
+  defp assert_due_at_between(due_at_ms, min_due_at_ms, max_due_at_ms)
+       when is_integer(due_at_ms) and is_integer(min_due_at_ms) and is_integer(max_due_at_ms) do
+    assert due_at_ms >= min_due_at_ms
+    assert due_at_ms <= max_due_at_ms
   end
 
   defp restore_app_env(key, nil), do: Application.delete_env(:symphony_elixir, key)
